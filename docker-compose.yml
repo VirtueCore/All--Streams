@@ -1,0 +1,38 @@
+services:
+  warp:
+    image: caomingjun/warp:latest
+    container_name: warp
+    restart: always
+    environment:
+      - ACCEPT_LICENSE=Y
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    ports:
+      - "8085:8085"   # Fluxstream Proxy port
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+
+  fluxstream:
+    build:
+      context: ./fluxstream
+    container_name: fluxstream
+    restart: unless-stopped
+    network_mode: "service:warp"
+
+  fluxresolver:
+    build:
+      context: ./fluxresolver
+    container_name: fluxresolver
+    restart: unless-stopped
+    ports:
+      - "7000:7000"   # Fluxresolver port directly on host IP
+    shm_size: "2gb"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=7000
+
+volumes:
+  warp-data:
