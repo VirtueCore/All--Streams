@@ -347,7 +347,7 @@ The stack consists of three containers:
 
 ## Cloudflare WARP
 
-Provides a dedicated network namespace used by the Live TV proxy to route outbound traffic. The `timstreams-proxy` service shares WARP's network stack using `network_mode: service:warp`. 
+Provides a dedicated network namespace used by the Live TV proxy to route outbound traffic. The `fluxstream` service shares WARP's network stack using `network_mode: service:warp`. 
 
 ## FluxStream
 
