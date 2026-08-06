@@ -4,7 +4,7 @@
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi)
 ![Playwright](https://img.shields.io/badge/Playwright-Chromium-green)
-![License](https://img.shields.io/badge/License-MIT-yellow)
+![License](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
 > **A self-hosted streaming platform combining a custom IPTV proxy, automatic Live TV playlist generation, and a high-performance Stremio addon for movies and TV shows.**
 
