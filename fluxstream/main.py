@@ -19,12 +19,21 @@ PORT = int(os.environ.get("PORT", 8085))
 HOST = os.environ.get("HOST", "0.0.0.0")
 
 ORIGIN_SITE = "https://timstreams.st"
+BACKUP_ORIGIN_SITE = "https://timst.cfd"
+
 API_ENDPOINTS = [
+    # Main domain
     "https://api.timstreams.st/api/channels",
     f"{ORIGIN_SITE}/api/channels",
     f"{ORIGIN_SITE}/api/live",
     "https://api.timstreams.st/channels",
     f"{ORIGIN_SITE}/channels.json",
+    # Backup domain
+    "https://api.timst.cfd/api/channels",
+    f"{BACKUP_ORIGIN_SITE}/api/channels",
+    f"{BACKUP_ORIGIN_SITE}/api/live",
+    "https://api.timst.cfd/channels",
+    f"{BACKUP_ORIGIN_SITE}/channels.json",
 ]
 
 CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -81,7 +90,7 @@ class PersistentBrowserManager:
             )
             print("[+] Persistent Chromium session initialized.")
 
-            # --- Immediate warm‑up: load a blank page to fully activate the context ---
+            # Immediate warm‑up: load a blank page to fully activate the context
             try:
                 page = await self.context.new_page()
                 await page.goto("about:blank", wait_until="commit", timeout=3000)
@@ -132,8 +141,7 @@ class PersistentBrowserManager:
 
     async def sniff_channel(self, embed_url: str, retry_on_failure: bool = True) -> Tuple[Optional[str], dict]:
         """
-        Sniffs for an HLS URL on the embed page. If retry_on_failure is True and no URL is found,
-        it will attempt one more time after a short delay (useful when the browser is cold).
+        Sniffs for an HLS URL on the embed page.
         """
         for attempt in range(2 if retry_on_failure else 1):
             if attempt > 0:
@@ -235,8 +243,19 @@ async def is_hls_valid(url: str, headers: dict) -> bool:
         async with client.stream("GET", url, headers=clean_headers, timeout=3.0) as resp:
             if resp.status_code != 200:
                 return False
-            chunk = await resp.aread(512)
-            return chunk.startswith(b"#EXTM3U")
+            # Read up to 8 KB to inspect the playlist
+            chunk = b""
+            async for part in resp.aiter_bytes(4096):
+                chunk += part
+                if len(chunk) > 8192:
+                    break
+            text = chunk.decode('utf-8', errors='ignore')
+            if not text.startswith("#EXTM3U"):
+                return False
+            # Require at least one segment line to filter stub playlists
+            if not re.search(r'#EXTINF:.*\n(?!https?://)[^\s#]+\.(?:ts|m3u8)', text):
+                return False
+            return True
     except Exception:
         return False
 
@@ -322,6 +341,20 @@ async def background_cache_worker():
         await asyncio.sleep(CACHE_REFRESH_INTERVAL)
 
 
+async def warmup_browser():
+    """Pre-warm the browser by navigating to the main site once."""
+    try:
+        # Wait a moment for the browser to be fully ready
+        await asyncio.sleep(1)
+        if browser_manager.context:
+            page = await browser_manager.context.new_page()
+            await page.goto(ORIGIN_SITE, wait_until="commit", timeout=5000)
+            await page.close()
+            print("[+] Browser pre‑warmed to main site.")
+    except Exception as e:
+        print(f"[-] Pre‑warm failed (non‑critical): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client
@@ -340,6 +373,7 @@ async def lifespan(app: FastAPI):
     )
 
     await browser_manager.start()
+    asyncio.ensure_future(warmup_browser())   # non‑blocking pre‑warm
     keepalive_task = asyncio.create_task(browser_manager._keepalive())
     worker_task = asyncio.create_task(background_cache_worker())
     print("[+] FastAPI FFmpeg Session Proxy initialized.")
@@ -363,26 +397,63 @@ app.add_middleware(
 
 
 async def try_http_scrape(embed_url: str) -> Optional[str]:
+    """
+    Enhanced scraper that looks for m3u8 URLs in page source,
+    including those embedded in JavaScript variables.
+    """
     try:
-        headers = {**CHROME_HEADERS, "Referer": ORIGIN_SITE}
-        res = await client.get(embed_url, headers=headers, timeout=3.0)
-        if res.status_code == 200:
-            matches = re.findall(r'https?://[^\s<>"\']+\.m3u8[^\s<>"\']*', res.text)
-            for m in matches:
-                clean = sanitize_stream_url(m)
-                if clean and "icelanders.st" not in clean:
+        parsed = urlparse(embed_url)
+        referer = f"{parsed.scheme}://{parsed.netloc}"
+        headers = {**CHROME_HEADERS, "Referer": referer}
+        resp = await client.get(embed_url, headers=headers, timeout=3.0)
+        if resp.status_code != 200:
+            return None
+
+        text = resp.text
+        # Patterns: attribute assignments like source: "..." or '...', and generic quoted URLs
+        patterns = [
+            r'(?:source|src|stream|url|file|hls|src)\s*[:=]\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
+            r'["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',  # generic quoted URL
+            r'https?://[^\s<>"\']+\.m3u8[^\s<>"\']*',     # fallback simple regex
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                # If match is a tuple (from capture groups), flatten
+                url = match[0] if isinstance(match, tuple) else match
+                clean = sanitize_stream_url(url)
+                if clean and not any(ext in clean.lower() for ext in [".jpg", ".png", ".jpeg", ".webp"]):
                     return clean
     except Exception:
         pass
     return None
 
 
+async def try_iframe_scrape(embed_url: str) -> Optional[str]:
+    """
+    Fetch the embed page, find the first iframe src, then scrape that iframe page.
+    """
+    try:
+        parsed = urlparse(embed_url)
+        referer = f"{parsed.scheme}://{parsed.netloc}"
+        headers = {**CHROME_HEADERS, "Referer": referer}
+        resp = await client.get(embed_url, headers=headers, timeout=3.0)
+        if resp.status_code != 200:
+            return None
+        text = resp.text
+        iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', text, re.IGNORECASE)
+        if not iframe_match:
+            return None
+        iframe_src = iframe_match.group(1)
+        if not iframe_src.startswith("http"):
+            iframe_src = urljoin(embed_url, iframe_src)
+        # Scrape the iframe page using the enhanced scraper
+        return await try_http_scrape(iframe_src)
+    except Exception:
+        return None
+
+
 async def resolve_channel_session(channel_id: str, force_refresh: bool = False) -> Tuple[Optional[str], dict]:
-    """
-    Resolves an HLS stream for the given channel. 
-    Implements a two‑pass strategy: on first failure it forces a browser restart
-    and retries the Playwright sniffing step once, which handles cold‑start scenarios.
-    """
     clean_id = str(channel_id).strip()
 
     if clean_id not in CHANNEL_SESSIONS:
@@ -416,54 +487,71 @@ async def resolve_channel_session(channel_id: str, force_refresh: bool = False) 
         candidates = []
         if target_stream:
             candidates.append(target_stream)
+
+        # Reordered: main site's watch (fast success) → embed → iframe domain → backup
         candidates.extend([
-            f"{ORIGIN_SITE}/embed/{clean_id}",
             f"{ORIGIN_SITE}/watch/{clean_id}",
+            f"{ORIGIN_SITE}/embed/{clean_id}",
+        ])
+        candidates.append(f"https://logic.icelanders.st/embed/{clean_id}")
+        candidates.extend([
+            f"{BACKUP_ORIGIN_SITE}/embed/{clean_id}",
+            f"{BACKUP_ORIGIN_SITE}/watch/{clean_id}",
         ])
 
         # --------------- FIRST PASS ---------------
         print(f"[*] First pass for {clean_id}: {len(candidates)} candidates")
         for candidate in candidates:
             candidate = sanitize_stream_url(candidate)
-            if not candidate or "icelanders.st" in candidate:
+            if not candidate:
                 continue
 
             # Direct .m3u8 URL
             if ".m3u8" in candidate.lower():
-                headers = {**CHROME_HEADERS, "Referer": ORIGIN_SITE, "Origin": f"https://{urlparse(candidate).netloc}"}
+                headers = {**CHROME_HEADERS, "Referer": ORIGIN_SITE,
+                           "Origin": f"https://{urlparse(candidate).netloc}"}
                 if await is_hls_valid(candidate, headers):
-                    print(f"[+] Found valid direct HLS for {clean_id}")
+                    print(f"[+] Found valid direct HLS for {clean_id} using candidate: {candidate}")
                     session.hls_url = candidate
                     session.headers = headers
                     session.last_updated = time.time()
                     return candidate, headers
 
-            # HTTP scrape
+            # Enhanced HTTP scrape
+            scraped_url = None
             try:
                 scraped_url = await asyncio.wait_for(try_http_scrape(candidate), timeout=3.0)
             except asyncio.TimeoutError:
-                scraped_url = None
+                pass
+
+            # If main/backup domain, also try iframe chain (only if not already found)
+            if not scraped_url and (ORIGIN_SITE in candidate or BACKUP_ORIGIN_SITE in candidate):
+                try:
+                    scraped_url = await asyncio.wait_for(try_iframe_scrape(candidate), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
 
             if scraped_url:
-                headers = {**CHROME_HEADERS, "Referer": candidate, "Origin": f"https://{urlparse(scraped_url).netloc}"}
+                headers = {**CHROME_HEADERS, "Referer": candidate,
+                           "Origin": f"https://{urlparse(scraped_url).netloc}"}
                 if await is_hls_valid(scraped_url, headers):
-                    print(f"[+] Found valid scraped HLS for {clean_id}")
+                    print(f"[+] Found valid scraped HLS for {clean_id} using candidate: {candidate}")
                     session.hls_url = scraped_url
                     session.headers = headers
                     session.last_updated = time.time()
                     return scraped_url, headers
 
-            # Playwright sniff (first try)
+            # Playwright sniff (last resort)
             try:
                 sniffed_url, sniff_headers = await asyncio.wait_for(
-                    browser_manager.sniff_channel(candidate, retry_on_failure=False),  # no internal retry here
-                    timeout=5.0
+                    browser_manager.sniff_channel(candidate, retry_on_failure=False), timeout=5.0
                 )
             except asyncio.TimeoutError:
                 sniffed_url = None
 
             if sniffed_url:
                 sniffed_url = sanitize_stream_url(sniffed_url)
+                print(f"[+] Found sniffed HLS for {clean_id} using candidate: {candidate}")
                 session.hls_url = sniffed_url
                 session.headers = sniff_headers
                 session.last_updated = time.time()
@@ -472,21 +560,20 @@ async def resolve_channel_session(channel_id: str, force_refresh: bool = False) 
         # --------------- SECOND PASS (forced browser restart + retry) ---------------
         print(f"[!] First pass failed for {clean_id}. Attempting second pass with browser reset...")
         try:
-            await browser_manager.ensure_browser()  # will restart if needed
-            # Retry only the Playwright sniff on the first candidate
-            for candidate in candidates[:1]:  # only the first one to save time
+            await browser_manager.ensure_browser()
+            for candidate in candidates[:1]:  # retry only first candidate
                 candidate = sanitize_stream_url(candidate)
-                if not candidate or "icelanders.st" in candidate:
+                if not candidate:
                     continue
                 try:
                     sniffed_url, sniff_headers = await asyncio.wait_for(
-                        browser_manager.sniff_channel(candidate, retry_on_failure=True),
-                        timeout=7.0   # a little more time
+                        browser_manager.sniff_channel(candidate, retry_on_failure=True), timeout=7.0
                     )
                 except asyncio.TimeoutError:
                     continue
                 if sniffed_url:
                     sniffed_url = sanitize_stream_url(sniffed_url)
+                    print(f"[+] Second pass resolved HLS for {clean_id} using candidate: {candidate}")
                     session.hls_url = sniffed_url
                     session.headers = sniff_headers
                     session.last_updated = time.time()
@@ -528,7 +615,6 @@ async def get_playlist(req: Request):
 async def handle_stream_request(channel_id: str):
     clean_id = str(channel_id).strip()
     
-    # Outer timeout: 15s (gives room for the second pass)
     try:
         stream_url, headers = await asyncio.wait_for(
             resolve_channel_session(clean_id), timeout=15.0
