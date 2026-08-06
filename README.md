@@ -280,8 +280,6 @@ docker compose restart warp
 
 ---
 
-## 8. Add FAQ
-
 # FAQ
 
 ### Does this project include TV channels?
