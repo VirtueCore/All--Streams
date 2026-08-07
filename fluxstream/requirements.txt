@@ -1,4 +1,6 @@
 fastapi
 uvicorn[standard]
-httpx
+httpx[http2]
 playwright
+aiohttp>=3.8
+requests
