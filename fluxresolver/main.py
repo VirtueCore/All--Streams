@@ -29,12 +29,14 @@ class Config:
     PORT = int(os.getenv("PORT", "7000"))
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
     PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "15000"))
-    STREAM_WAIT_TIMEOUT = float(os.getenv("STREAM_WAIT_TIMEOUT", "12.0"))    # reduced
-    GLOBAL_RESOLVE_TIMEOUT = float(os.getenv("GLOBAL_RESOLVE_TIMEOUT", "25.0"))  # reduced
-    MAX_CONCURRENT_PROVIDERS = int(os.getenv("MAX_CONCURRENT_PROVIDERS", "7"))    # all at once
+    STREAM_WAIT_TIMEOUT = float(os.getenv("STREAM_WAIT_TIMEOUT", "12.0"))
+    GLOBAL_RESOLVE_TIMEOUT = float(os.getenv("GLOBAL_RESOLVE_TIMEOUT", "25.0"))
+    MAX_CONCURRENT_PROVIDERS = int(os.getenv("MAX_CONCURRENT_PROVIDERS", "7"))
     SAVE_DEBUG_ARTIFACTS = os.getenv("SAVE_DEBUG_ARTIFACTS", "False").lower() in ("true", "1")
     DEBUG_DIR = os.getenv("DEBUG_DIR", "./debug_captures")
-    PLAYLIST_CACHE_TTL = float(os.getenv("PLAYLIST_CACHE_TTL", "5.0"))   # shorter to avoid stale tokens
+    PLAYLIST_CACHE_TTL = float(os.getenv("PLAYLIST_CACHE_TTL", "5.0"))
+
+    ADDON_WAIT_TIMEOUT = float(os.getenv("ADDON_WAIT_TIMEOUT", "5.0"))  # seconds the add-on will wait for direct URL
 
     DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     USER_AGENTS = [
@@ -44,8 +46,8 @@ class Config:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
     ]
 
-    # ID list refresh interval (24 hours)
-    ID_LIST_REFRESH_SEC = int(os.getenv("ID_LIST_REFRESH_SEC", "86400"))
+    ID_LIST_REFRESH_SEC = int(os.getenv("ID_LIST_REFRESH_SEC", "7200"))
+    ID_LIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "id_lists")
     ID_LIST_BASE = "https://vidsrcme.ru/ids"
     ID_LISTS = {
         "movie_imdb": f"{ID_LIST_BASE}/movie_imdb.txt",
@@ -74,7 +76,7 @@ class Provider:
 # --- REORDERED PROVIDERS: reliable ones first ---
 PROVIDERS: List[Provider] = [
     Provider(
-        name="vidsrc.in",   # works reliably → now top priority
+        name="vidsrc.in",
         tv_template="https://vidsrc.in/embed/tv/{imdb}/{season}/{episode}",
         movie_template="https://vidsrc.in/embed/movie/{imdb}",
         priority=1,
@@ -133,12 +135,14 @@ class AppState:
         "successful_resolves": 0,
         "failed_resolves": 0,
         "unsupported_rejects": 0,
-        "token_refreshes": 0,        # new metric
+        "token_refreshes": 0,
     }
 
     movie_ids: Set[str] = set()
     tv_ids: Set[str] = set()
     episode_ids: Set[str] = set()
+
+    in_flight: Dict[str, asyncio.Task] = {}   # prevent duplicate sniff sessions
 
 
 state = AppState()
@@ -168,25 +172,48 @@ async def ensure_browser() -> Browser:
 
 
 # ------------------------------------------------------------------------------
-#  ID LIST DOWNLOAD & CACHING
-# ------------------------------------------------------------------------------
-async def fetch_ids_file(url: str) -> Set[str]:
+async def fetch_ids_file(name: str, remote_url: str) -> Set[str]:
+    os.makedirs(Config.ID_LIST_DIR, exist_ok=True)
+    local_path = os.path.join(Config.ID_LIST_DIR, f"{name}.txt")
+
+    if os.path.exists(local_path):
+        file_age = time.time() - os.path.getmtime(local_path)
+        if file_age < Config.ID_LIST_REFRESH_SEC:
+            try:
+                with open(local_path, "r") as f:
+                    lines = f.readlines()
+                return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
+            except Exception:
+                logger.warning(f"Failed to read local ID list {local_path}, re-downloading.")
+
     try:
-        resp = await state.client.get(url, headers={"User-Agent": Config.DEFAULT_UA})
+        resp = await state.client.get(remote_url, headers={"User-Agent": Config.DEFAULT_UA})
         if resp.status_code == 200:
-            lines = resp.text.strip().splitlines()
+            text = resp.text
+            with open(local_path, "w") as f:
+                f.write(text)
+            lines = text.strip().splitlines()
             return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
         else:
-            logger.warning(f"Failed to fetch ID list {url} (status {resp.status_code})")
+            logger.warning(f"Failed to fetch ID list {remote_url} (status {resp.status_code})")
     except Exception as e:
-        logger.warning(f"Error fetching ID list {url}: {e}")
+        logger.warning(f"Error fetching ID list {remote_url}: {e}")
+
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r") as f:
+                lines = f.readlines()
+            return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
+        except Exception:
+            pass
+
     return set()
 
 
 async def refresh_id_lists():
-    movie_set = await fetch_ids_file(Config.ID_LISTS["movie_imdb"])
-    tv_set = await fetch_ids_file(Config.ID_LISTS["tv_imdb"])
-    eps_set = await fetch_ids_file(Config.ID_LISTS["eps_imdb"])
+    movie_set = await fetch_ids_file("movie_imdb", Config.ID_LISTS["movie_imdb"])
+    tv_set = await fetch_ids_file("tv_imdb", Config.ID_LISTS["tv_imdb"])
+    eps_set = await fetch_ids_file("eps_imdb", Config.ID_LISTS["eps_imdb"])
     async with state.cache_lock:
         state.movie_ids = movie_set
         state.tv_ids = tv_set
@@ -299,13 +326,11 @@ async def sniff_single_mirror(provider: Provider, embed_url: str) -> Tuple[Optio
         stream_found = asyncio.Event()
         iframe_loaded = False
 
-        # We'll use a separate event to detect if any iframe loaded
         async def detect_iframe(request):
             nonlocal iframe_loaded
             if request.resource_type == "document" and request.url != embed_url:
                 iframe_loaded = True
 
-        # Register iframe detection first (before the main handlers) to catch early iframes
         context.on("request", lambda req: asyncio.create_task(detect_iframe(req)))
 
         async def handle_request(request):
@@ -385,7 +410,6 @@ async def sniff_single_mirror(provider: Provider, embed_url: str) -> Tuple[Optio
         logger.info(f"[{provider.name}] Navigating to: {embed_url}")
         await page.goto(embed_url, wait_until="domcontentloaded", timeout=Config.PAGE_TIMEOUT_MS)
 
-        # --- Early bailout: if no iframe loaded within 5 seconds, provider is dead ---
         start = time.time()
         while time.time() - start < 5.0:
             if iframe_loaded or stream_found.is_set():
@@ -395,10 +419,8 @@ async def sniff_single_mirror(provider: Provider, embed_url: str) -> Tuple[Optio
             logger.debug(f"[{provider.name}] No iframe loaded within 5s, aborting.")
             return None, None, None
 
-        # Wait a bit more for the iframe to start making requests
         await asyncio.sleep(1.5)
 
-        # JS fallback
         try:
             for frame in page.frames:
                 try:
@@ -415,7 +437,6 @@ async def sniff_single_mirror(provider: Provider, embed_url: str) -> Tuple[Optio
         except Exception:
             pass
 
-        # Quick interactions
         for _ in range(2):
             if stream_found.is_set():
                 break
@@ -456,65 +477,77 @@ async def resolve_stream(
     imdb_id: str, season: Optional[str] = None, episode: Optional[str] = None
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     cache_key = f"{imdb_id}:{season or ''}:{episode or ''}"
+
+    # 1. Return cached result if fresh
     async with state.cache_lock:
         cached = state.stream_cache.get(cache_key)
         if cached and (time.time() - cached["timestamp"] < Config.CACHE_TTL_SECONDS):
             state.metrics["cache_hits"] += 1
             return cached["stream_url"], cached["stype"], cached["referer"]
 
-    active = [p for p in PROVIDERS if p.enabled]
-    active.sort(key=lambda p: p.priority)
-    sem = asyncio.Semaphore(Config.MAX_CONCURRENT_PROVIDERS)
+        # 2. If an in‑flight task exists, wait for it
+        if cache_key in state.in_flight:
+            task = state.in_flight[cache_key]
+    if cache_key in state.in_flight:
+        logger.info(f"Waiting for in‑flight resolution of {cache_key}")
+        return await task
 
-    async def worker(p: Provider):
-        async with sem:
-            return await sniff_single_mirror(p, p.get_url(imdb_id, season, episode))
+    # 3. Create a new resolution task
+    async def do_resolve():
+        active = [p for p in PROVIDERS if p.enabled]
+        active.sort(key=lambda p: p.priority)
+        sem = asyncio.Semaphore(Config.MAX_CONCURRENT_PROVIDERS)
 
-    tasks = [asyncio.create_task(worker(p)) for p in active]
-    pending = set(tasks)
-    result = (None, None, None)
+        async def worker(p: Provider):
+            async with sem:
+                return await sniff_single_mirror(p, p.get_url(imdb_id, season, episode))
 
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            try:
-                stream_url, stype, referer = task.result()
-                if stream_url:
-                    result = (stream_url, stype, referer)
-                    for t in pending:
-                        t.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    pending.clear()
-                    break
-            except Exception as e:
-                logger.debug(f"Task exception: {e}")
+        tasks = [asyncio.create_task(worker(p)) for p in active]
+        pending = set(tasks)
+        result = (None, None, None)
 
-    stream_url, stype, referer = result
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    stream_url, stype, referer = task.result()
+                    if stream_url:
+                        result = (stream_url, stype, referer)
+                        for t in pending:
+                            t.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        pending.clear()
+                        break
+                except Exception as e:
+                    logger.debug(f"Task exception: {e}")
+
+        stream_url, stype, referer = result
+        async with state.cache_lock:
+            if stream_url:
+                state.stream_cache[cache_key] = {
+                    "stream_url": stream_url,
+                    "stype": stype,
+                    "referer": referer,
+                    "timestamp": time.time(),
+                }
+                state.metrics["successful_resolves"] += 1
+            else:
+                state.metrics["failed_resolves"] += 1
+            # Remove from in‑flight after finishing
+            state.in_flight.pop(cache_key, None)
+        return result
+
+    task = asyncio.create_task(do_resolve())
     async with state.cache_lock:
-        if stream_url:
-            state.stream_cache[cache_key] = {
-                "stream_url": stream_url,
-                "stype": stype,
-                "referer": referer,
-                "timestamp": time.time(),
-            }
-            state.metrics["successful_resolves"] += 1
-            return stream_url, stype, referer
-        else:
-            state.metrics["failed_resolves"] += 1
+        state.in_flight[cache_key] = task
 
-    logger.error(f"All providers failed for {cache_key}")
-    return None, None, None
+    return await task
 
 
 # ------------------------------------------------------------------------------
 #  TOKEN REFRESH – re‑extract fresh stream URL when 403 occurs
 # ------------------------------------------------------------------------------
 async def refresh_stream_url(original_referer: str) -> Optional[str]:
-    """
-    Given the original embed page URL (referer), re‑run the browser extraction
-    to get a new stream URL with a fresh token.
-    """
     parsed = urlparse(original_referer)
     provider_name = parsed.netloc.lower().replace("www.", "")
     provider = next((p for p in PROVIDERS if p.name == provider_name or provider_name.startswith(p.name)), None)
@@ -576,11 +609,10 @@ async def fetch_upstream_m3u8(target_url: str, ref_header: str) -> str:
                     state.playlist_cache[target_url] = {"content": text, "timestamp": time.time()}
                 return text
             elif resp.status_code == 403:
-                # Token expired – refresh
                 logger.warning(f"Master playlist 403, attempting token refresh.")
                 new_url = await refresh_stream_url(ref_header)
                 if new_url:
-                    raise HTTPException(status_code=302, detail=new_url)  # will be caught and redirected
+                    raise HTTPException(status_code=302, detail=new_url)
         except HTTPException:
             raise
         except Exception as e:
@@ -625,6 +657,37 @@ async def proxy_stream_request(target_url: str, ref_header: str, req: Request):
     raise HTTPException(status_code=502, detail="Upstream media fetch failed")
 
 
+# ------------------------------------------------------------------------------
+#  LAZY PROXY – resolves stream on demand, then redirects
+# ------------------------------------------------------------------------------
+@app.api_route("/lazy-proxy", methods=["GET", "HEAD"])
+async def lazy_proxy(
+    imdb: str,
+    season: Optional[str] = None,
+    episode: Optional[str] = None,
+    req: Request = None,
+):
+    """
+    Resolve the stream lazily and redirect to the correct proxy endpoint.
+    """
+    stream_url, resolved_type, referer = await resolve_stream(imdb, season, episode)
+    if not stream_url or not referer:
+        raise HTTPException(status_code=502, detail="No stream found for this content")
+
+    base = str(req.base_url)
+    if resolved_type == "mp4":
+        proxy_target = f"{base}proxy/media?url={quote(stream_url)}&referer={quote(referer)}"
+    elif resolved_type == "mpd":
+        proxy_target = f"{base}proxy/media?url={quote(stream_url)}&referer={quote(referer)}"
+    else:  # m3u8 or anything else
+        proxy_target = f"{base}proxy/m3u8?url={quote(stream_url)}&referer={quote(referer)}"
+
+    return RedirectResponse(url=proxy_target, status_code=302)
+
+
+# ------------------------------------------------------------------------------
+#  EXISTING PROXY ENDPOINTS
+# ------------------------------------------------------------------------------
 @app.api_route("/proxy/media", methods=["GET", "HEAD"])
 async def proxy_media(url: str, referer: str, req: Request):
     return await proxy_stream_request(unquote(url), unquote(referer), req)
@@ -645,7 +708,6 @@ async def proxy_m3u8(url: str, referer: str, req: Request):
         content_text = await fetch_upstream_m3u8(target_url, ref_header)
     except HTTPException as e:
         if e.status_code == 302:
-            # Token refresh gave us a new URL
             new_url = e.detail
             return RedirectResponse(
                 url=f"{base_proxy}proxy/m3u8?url={quote(new_url)}&referer={quote(ref_header)}",
@@ -687,6 +749,9 @@ async def proxy_m3u8(url: str, referer: str, req: Request):
     )
 
 
+# ------------------------------------------------------------------------------
+#  ROUTES
+# ------------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     browser_ok = state.browser is not None and state.browser.is_connected()
@@ -717,8 +782,8 @@ def manifest():
     return {
         "id": "org.vidsrc.local.addon",
         "version": "6.0.0",
-        "name": "VidSrc Resolver (Lightning + Auto‑Heal)",
-        "description": "Instant ID‑filtered stream resolver with parallel sniffing, early dead‑provider pruning, and automatic token refresh.",
+        "name": "VidSrc Resolver (Hybrid Fast‑Start)",
+        "description": "Add‑on waits up to 5s for direct stream, else falls back to lazy proxy.",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -741,28 +806,72 @@ async def get_stream(type: str, id: str, req: Request):
         logger.info(f"ID {clean_id} not in VidSrc lists – rejecting instantly.")
         return {"streams": []}
 
-    try:
-        stream_url, stype, origin_referer = await asyncio.wait_for(
-            resolve_stream(imdb_id, season, episode),
-            timeout=Config.GLOBAL_RESOLVE_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        logger.error(f"Global timeout ({Config.GLOBAL_RESOLVE_TIMEOUT}s) reached for {clean_id}")
-        return {"streams": []}
+    cache_key = f"{imdb_id}:{season or ''}:{episode or ''}"
 
-    if stream_url and origin_referer:
+    # Check cache first
+    async with state.cache_lock:
+        cached = state.stream_cache.get(cache_key)
+    if cached and (time.time() - cached["timestamp"] < Config.CACHE_TTL_SECONDS):
+        # Already resolved – return direct URL instantly
+        stream_url, stype, referer = cached["stream_url"], cached["stype"], cached["referer"]
         base = str(req.base_url)
         if stype == "mp4":
-            proxied = f"{base}proxy/media?url={quote(stream_url)}&referer={quote(origin_referer)}"
+            proxied = f"{base}proxy/media?url={quote(stream_url)}&referer={quote(referer)}"
             title = "⚡ Direct MP4"
         elif stype == "mpd":
-            proxied = f"{base}proxy/media?url={quote(stream_url)}&referer={quote(origin_referer)}"
+            proxied = f"{base}proxy/media?url={quote(stream_url)}&referer={quote(referer)}"
             title = "⚡ MPEG-DASH"
         else:
-            proxied = f"{base}proxy/m3u8?url={quote(stream_url)}&referer={quote(origin_referer)}"
+            proxied = f"{base}proxy/m3u8?url={quote(stream_url)}&referer={quote(referer)}"
             title = "⚡ HLS (Proxied)"
         return {"streams": [{"name": "VidSrc Direct", "title": title, "url": proxied}]}
-    return {"streams": []}
+
+    # Start background resolution (will be deduplicated)
+    resolve_task = asyncio.create_task(resolve_stream(imdb_id, season, episode))
+
+    try:
+        # Wait up to ADDON_WAIT_TIMEOUT seconds for the stream
+        stream_url, stype, referer = await asyncio.wait_for(asyncio.shield(resolve_task), timeout=Config.ADDON_WAIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        # Not ready yet – fall back to lazy URL
+        base = str(req.base_url)
+        lazy_url = f"{base}lazy-proxy?imdb={quote(imdb_id)}"
+        if season:
+            lazy_url += f"&season={season}"
+        if episode:
+            lazy_url += f"&episode={episode}"
+        return {"streams": [{
+            "name": "VidSrc Direct",
+            "title": "⚡ HLS (Lazy)",
+            "url": lazy_url
+        }]}
+
+    # Resolution succeeded within the timeout – return the direct proxied URL
+    if not stream_url or not referer:
+        # All providers failed quickly, still return lazy (player will get 502 if all fail eventually)
+        base = str(req.base_url)
+        lazy_url = f"{base}lazy-proxy?imdb={quote(imdb_id)}"
+        if season:
+            lazy_url += f"&season={season}"
+        if episode:
+            lazy_url += f"&episode={episode}"
+        return {"streams": [{
+            "name": "VidSrc Direct",
+            "title": "⚡ HLS (Lazy)",
+            "url": lazy_url
+        }]}
+
+    base = str(req.base_url)
+    if stype == "mp4":
+        proxied = f"{base}proxy/media?url={quote(stream_url)}&referer={quote(referer)}"
+        title = "⚡ Direct MP4"
+    elif stype == "mpd":
+        proxied = f"{base}proxy/media?url={quote(stream_url)}&referer={quote(referer)}"
+        title = "⚡ MPEG-DASH"
+    else:
+        proxied = f"{base}proxy/m3u8?url={quote(stream_url)}&referer={quote(referer)}"
+        title = "⚡ HLS (Proxied)"
+    return {"streams": [{"name": "VidSrc Direct", "title": title, "url": proxied}]}
 
 
 if __name__ == "__main__":
