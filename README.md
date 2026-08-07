@@ -176,6 +176,14 @@ git clone https://github.com/YOUR_USERNAME/All--Streams.git
 cd All--Streams
 ```
 
+Create an IPv4 BuildKit builder
+
+```bash
+docker buildx create --name ipv4 --driver docker-container --use
+```
+
+On hosts without working IPv6 connectivity, BuildKit resolves Docker Hub to an IPv6 address and the build fails with `network is unreachable`. Running BuildKit inside a container keeps registry pulls on IPv4.
+
 Build the containers
 
 ```bash
